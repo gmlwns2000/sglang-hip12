@@ -150,7 +150,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
                     # if layer.layer_id == 31:
                 else:
                     k_chunk = v_chunk = None
-                
+
                 # print(layer.layer_id, k[::1,0,0], v[::1,0,0])
 
                 o_req, _ = self.forward_paged_hip(
@@ -206,7 +206,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
                 assert v is not None
                 if save_kv_cache:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, 
+                        layer, cache_loc, k, v,
                         async_copy=False, push_to_gpu_cache=True,
                     )
             k_cache = v_cache = None
@@ -245,9 +245,9 @@ class HiPRadixAttentionBackend(AttentionBackend):
         )
 
         forward_batch.hip_metadata_cache_pool.set_hip_metadata_cache(
-            layer_id=layer.layer_id, 
+            layer_id=layer.layer_id,
             size=q.shape[0],
-            batch_size=forward_batch.batch_size, 
+            batch_size=forward_batch.batch_size,
             metadata=metadata,
         )
 
@@ -280,7 +280,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
         v: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, "HiPAttentionOutputMetadata"]:
         is_dense = layer.layer_id in self.hip_config.dense_layers
-        
+
         if len(self.hip_config.layers) == 2:
             layer_config = self.hip_config.layers[0 if is_dense else 1]
         else:
@@ -346,6 +346,18 @@ class HiPRadixAttentionBackend(AttentionBackend):
             sa_extend_backend=layer_config.sa_extend_backend,
         )
 
+        print("===>", layer.layer_id, query.shape, args.k_cache.shape, args.v_cache.shape,
+              args.block_table.shape,
+              args.cache_seq_lens.shape, args.position_ids.shape,
+              query, args.k_cache, args.v_cache, args.block_table, args.cache_seq_lens, args.position_ids,
+              args.block_size_k, args.sliding_window_size, args.sink_token_size,
+              args.using_extend, args.need_apply_rope, args.rope_cos.shape, args.rope_sin.shape, args.logit_softcap,
+              layer_config.second_stage_k, layer_config.stages, layer.orig_context_len,
+              cached_metadata,  # stage_args['cached_metadata'],
+              args.block_sparse_block_size_q,
+              args.scan_extend_backend,
+              args.sa_extend_backend, sep="\n")
+
         # print(isinstance(k, torch.Tensor), isinstance(v, torch.Tensor), args.offload_cache, isinstance(args.k_cache, torch.Tensor))
 
         context, metadata = dual_stage_quadratic_hip_attention(
@@ -355,5 +367,12 @@ class HiPRadixAttentionBackend(AttentionBackend):
             cached_metadata=cached_metadata,
         )
         context = context.to(query.dtype)
+
+        print('context', context.shape)
+        print(context)
+
+        if layer.layer_id in [0, 1, 31]:
+            from sglang.utils import ForkedPdb
+            ForkedPdb().set_trace()
 
         return context.view(N, num_heads, hidden_dims), metadata
