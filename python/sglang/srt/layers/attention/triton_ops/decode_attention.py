@@ -622,15 +622,15 @@ def decode_attention_fwd_grouped(
 
 
 def decode_attention_fwd(
-    q,
-    k_buffer,
-    v_buffer,
-    o,
-    req_to_token,
-    b_req_idx,
-    b_seq_len,
-    attn_logits,
-    num_kv_splits,
+    q,  # [1, 32, 128]
+    k_buffer,  # [117847, 8, 128]
+    v_buffer,  # [117847, 8, 128]
+    o,  # [1, 32, 128]
+    req_to_token,  # [2049, 196612]
+    b_req_idx,  # [1], tensor([0])
+    b_seq_len,  # [1], tensor([34089])
+    attn_logits,  # [1, 32 (num_head), 8 (num_kv_splits), 129 (v_head_dim+1)]
+    num_kv_splits,  # 8
     sm_scale,
     logit_cap=0.0,
 ):

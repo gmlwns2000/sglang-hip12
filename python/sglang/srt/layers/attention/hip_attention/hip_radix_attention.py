@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 """
 Support different attention backends.
 Now there are two backends: FlashInfer and Triton.
@@ -16,6 +18,7 @@ import torch
 from sglang.srt.layers.attention import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.mem_cache.hip_offload_kv_pool_mha import MHATokenToHiPOffloadKVPool
+from sglang.srt.layers.attention.triton_ops.decode_sparse_attention import decode_block_sparse_attention
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -316,6 +319,11 @@ class HiPRadixAttentionBackend(AttentionBackend):
             raise Exception()
         is_gemma = hidden_size > 128
 
+        # Select sparse decoding backend
+        sparse_attn_backend = None
+        if dst_seq_len == 1 and os.environ.get('HIP_DISABLE_FLASHDECODE', '0') == '0':
+            sparse_attn_backend = decode_block_sparse_attention
+
         args = HiPAttentionArgs(
             k_cache=k_cache.view(torch.uint8) if isinstance(k_cache, torch.Tensor) and k_cache.dtype == torch.float8_e5m2 else k_cache,
             v_cache=v_cache.view(torch.uint8) if isinstance(k_cache, torch.Tensor) and v_cache.dtype == torch.float8_e5m2 else v_cache,
@@ -344,21 +352,8 @@ class HiPRadixAttentionBackend(AttentionBackend):
             scan_extend_backend=('relative' if self.hip_config.apply_v_dot
                                  else ('streaming' if is_dense else 'relative')),
             sa_extend_backend=layer_config.sa_extend_backend,
+            sparse_attn_backend=sparse_attn_backend,
         )
-
-        print("===>", layer.layer_id, query.shape, args.k_cache.shape, args.v_cache.shape,
-              args.block_table.shape,
-              args.cache_seq_lens.shape, args.position_ids.shape,
-              query, args.k_cache, args.v_cache, args.block_table, args.cache_seq_lens, args.position_ids,
-              args.block_size_k, args.sliding_window_size, args.sink_token_size,
-              args.using_extend, args.need_apply_rope, args.rope_cos.shape, args.rope_sin.shape, args.logit_softcap,
-              layer_config.second_stage_k, layer_config.stages, layer.orig_context_len,
-              cached_metadata,  # stage_args['cached_metadata'],
-              args.block_sparse_block_size_q,
-              args.scan_extend_backend,
-              args.sa_extend_backend, sep="\n")
-
-        # print(isinstance(k, torch.Tensor), isinstance(v, torch.Tensor), args.offload_cache, isinstance(args.k_cache, torch.Tensor))
 
         context, metadata = dual_stage_quadratic_hip_attention(
             (query * sm_scale).to(query.dtype),
@@ -367,12 +362,5 @@ class HiPRadixAttentionBackend(AttentionBackend):
             cached_metadata=cached_metadata,
         )
         context = context.to(query.dtype)
-
-        print('context', context.shape)
-        print(context)
-
-        if layer.layer_id in [0, 1, 31]:
-            from sglang.utils import ForkedPdb
-            ForkedPdb().set_trace()
 
         return context.view(N, num_heads, hidden_dims), metadata
