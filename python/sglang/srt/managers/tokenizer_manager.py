@@ -297,7 +297,7 @@ class TokenizerManager:
 
         while True:
             try:
-                await asyncio.wait_for(state.event.wait(), timeout=4)
+                await asyncio.wait_for(state.event.wait(), timeout=40000000)
             except asyncio.TimeoutError:
                 if request is not None and await request.is_disconnected():
                     self.abort_request(obj.rid)

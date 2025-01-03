@@ -166,7 +166,7 @@ def _fwd_kernel_stage1(
         ).to(q.dtype)
         sin_new = tl.load(
             SIN
-            + rope_tdst.to(tl.int64) * stride_sin_t +
+            + rope_tdst.to(tl.int64) * stride_sin_t
             + (offs_d[None, :] % (Lk // 2)) * stride_sin_hid,
         ).to(q.dtype)
 
@@ -477,6 +477,12 @@ def decode_block_sparse_attention_stage1(
     batch = q.shape[0]
     BLOCK_H = 16
     NUM_KV_SPLITS = 8  # TODO: apply from server args
+
+    temp_attn_logits = torch.zeros(
+        (batch, head_num, NUM_KV_SPLITS, HID + 1),
+        dtype=torch.float32, device=q.device
+    )
+
     grid = (
         batch,
         triton.cdiv(head_num, min(BLOCK_H, kv_group_num)),
@@ -496,7 +502,7 @@ def decode_block_sparse_attention_stage1(
 
         ks_start_end, *safe_stride(ks_start_end, 3),
 
-        # TODO: add ATTN_LOGITS
+        temp_attn_logits, *safe_stride(temp_attn_logits, 4),
 
         context, *safe_stride(context, 4),
 

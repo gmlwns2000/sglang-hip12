@@ -662,7 +662,7 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
                 url + request_name,
                 json=json_data,
                 headers=headers,
-                timeout=600,
+                timeout=60000000,
             )
             assert res.status_code == 200, f"{res}"
             logger.info(f'Warmup response: {res.json()}')
