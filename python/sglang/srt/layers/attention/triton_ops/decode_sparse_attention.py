@@ -34,12 +34,6 @@ def _fwd_kernel_stage1(
     ATTN_LOGITS,
     stride_attn_logits_bsz, stride_attn_logits_head, stride_attn_logits_kv_split, stride_attn_logits_hid,
 
-    CONTEXT,
-    stride_context_bsz,
-    stride_context_tdst,
-    stride_context_head,
-    stride_context_hid,
-
     q_head_num: tl.constexpr,
     BK: tl.constexpr,
     MAX_TDST,
@@ -155,6 +149,8 @@ def _fwd_kernel_stage1(
             + 0 * stride_q_tdst
             + cur_head[:, None] * stride_q_head
             + ((offs_d[None, :] + Lk // 2) % Lk) * stride_q_hid,
+            mask=(mask_h[:, None]) & (mask_d[None, :]),
+            other=0.0
         )
         if queries_rot.dtype == tl.float8e5:
             queries_rot = queries_rot.to(tl.float16)
@@ -163,11 +159,15 @@ def _fwd_kernel_stage1(
             COS
             + rope_tdst.to(tl.int64) * stride_cos_t
             + (offs_d[None, :] % (Lk // 2)) * stride_cos_hid,
+            mask=mask_d[None, :],
+            other=0.0
         ).to(q.dtype)
         sin_new = tl.load(
             SIN
             + rope_tdst.to(tl.int64) * stride_sin_t
             + (offs_d[None, :] % (Lk // 2)) * stride_sin_hid,
+            mask=mask_d[None, :],
+            other=0.0
         ).to(q.dtype)
 
         queries_rot = queries_rot * (((cur_head[:, None] + Lk // 2) < Lk) * (-2) + 1).to(q.dtype)
@@ -191,14 +191,14 @@ def _fwd_kernel_stage1(
     split_kv_block_start = kv_blocks_per_split * split_kv_id
     split_kv_block_end = tl.minimum(split_kv_block_start + kv_blocks_per_split, BK)
 
-    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")  # m_i
-    e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)  # l_i
+    e_max = tl.zeros([BLOCK_H, 1], dtype=tl.float32) - float("inf")  # m_i
+    e_sum = tl.zeros([BLOCK_H, 1], dtype=tl.float32)  # l_i
     acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
 
     if split_kv_block_end > split_kv_block_start:
         for i_bk in range(split_kv_block_start, split_kv_block_end, BLOCK_BK):
-            idx_bk = i_bk + tl.arange(0, BLOCK_BK)
-            mask_bk = (range_start <= idx_bk) & (idx_bk < tl.minimum(range_start + BK, range_end))
+            idx_bk = i_bk + tl.arange(0, BLOCK_BK)  # [BLOCK_BK]
+            mask_bk = (range_start <= idx_bk) & (idx_bk < tl.minimum(range_start + BK, range_end))  # [BLOCK_BK]
 
             if (range_start <= i_bk + BLOCK_BK) & (i_bk < range_end):
                 idx_tsrc_start = tl.load(
@@ -207,14 +207,14 @@ def _fwd_kernel_stage1(
                     + 0 * stride_indices_bdst
                     + idx_bk * stride_indices_bk,
                     mask=mask_bk,
-                )
+                )  # [BLOCK_BK]
                 idx_tsrc_start = tl.where(mask_bk, idx_tsrc_start, MAX_TSRC + 1)
                 idx_tsrc = idx_tsrc_start[:, None] + tl.arange(0, BLOCK_SIZE_K)[None, :]
                 idx_tsrc = tl.reshape(idx_tsrc, (BLOCK_BK * BLOCK_SIZE_K))
                 mask_tsrc_from_bk = mask_bk[:, None] & tl.full((1, BLOCK_SIZE_K), 1, dtype=tl.int1)
                 mask_tsrc_from_bk = tl.reshape(mask_tsrc_from_bk, (BLOCK_BK * BLOCK_SIZE_K))
                 mask_tsrc = ((MAX_TSRC * 0) <= idx_tsrc) & (idx_tsrc < (MAX_TSRC * 1)) & mask_tsrc_from_bk
-                idx_tsrc = idx_tsrc % MAX_TSRC
+                idx_tsrc = idx_tsrc % MAX_TSRC  # [BLOCK_BK * BLOCK_SIZE_K]
                 mask_tsrc = (sink_token_size <= idx_tsrc) & (idx_tsrc < cur_batch_seq_len) & mask_tsrc
 
                 keys = load_tokens(
@@ -325,7 +325,7 @@ def _fwd_kernel_stage1(
                         cur_batch,
                         idx_tsrc[None, :],
                         cur_kv_head,
-                        ((offs_d[:, None] + Lk // 2) % Lk)[:, None],
+                        ((offs_d[:, None] + Lk // 2) % Lk),
                         mask_tsrc[None, :],
 
                         BLOCK_SIZE_K,
@@ -398,13 +398,14 @@ def _fwd_kernel_stage1(
                     values,
 
                     idx_tsrc, mask_tsrc,
-                    0, 1,
+                    tl.zeros([1], dtype=tl.int32),
+                    ~tl.zeros([1], dtype=tl.int1),
 
                     acc, e_sum, e_max,
 
                     sliding_window_size,
                     sink_token_size,
-                    (range_end - range_start) * BLOCK_SIZE_K,
+                    (range_end - range_start) * BLOCK_SIZE_K,  # mask_k
                     True,
                     False,
                     LOGIT_SOFTCAP,
@@ -442,7 +443,7 @@ def _fwd_kernel_stage1(
     )
     tl.store(
         ATTN_LOGITS + offs_mid_o,
-        acc / e_sum[:, None],
+        acc / e_sum,
         mask=(mask_h[:, None]) & (mask_dv[None, :]),
     )
 
@@ -453,9 +454,9 @@ def _fwd_kernel_stage1(
         + Lv * stride_attn_logits_hid
     )
     tl.store(
-        ATTN_LOGITS + offs_mid_o_1,
+        ATTN_LOGITS + offs_mid_o_1[:, None],
         e_max + tl.log(e_sum),
-        mask=mask_h,
+        mask=mask_h[:, None],
     )
 
 
@@ -503,8 +504,6 @@ def decode_block_sparse_attention_stage1(
         ks_start_end, *safe_stride(ks_start_end, 3),
 
         temp_attn_logits, *safe_stride(temp_attn_logits, 4),
-
-        context, *safe_stride(context, 4),
 
         head_num, BK, MAX_TDST, MAX_TSRC, kv_group_num,
 
