@@ -916,7 +916,6 @@ def decode_block_sparse_attention_stage1(
     seq_lens: Tensor,
     indices: Tensor,
     ks_start_end: Tensor,
-    context: Tensor,
     args: HiPAttentionArgs,
     head_num: int, BK: int, MAX_TDST: int, MAX_TSRC: int, kv_group_num: int,
     model_context_length: int,
@@ -993,9 +992,102 @@ def decode_block_sparse_attention_stage1(
         EXTEND_BACKEND=extend_backend,
     )
 
+    return temp_attn_logits, NUM_TOTAL_KV_SPLITS
 
-def decode_block_sparse_attention_stage2():
-    pass
+
+@triton.jit
+def _fwd_kernel_stage2(
+    ATTN_LOGITS,
+    stride_attn_logits_bsz, stride_attn_logits_head, stride_attn_logits_kv_split, stride_attn_logits_hid,
+
+    O, stride_o_bsz, stride_o_tdst, stride_o_head, stride_o_hid,
+    B_Seqlen, stride_pos_bsz, stride_pos_tdst,
+
+    NUM_KV_SPLITS: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    Lv: tl.constexpr,
+):
+    cur_batch = tl.program_id(0)
+    cur_head = tl.program_id(1)
+
+    cur_batch_seq_len = tl.load(B_Seqlen + cur_batch * stride_pos_bsz + 0 * stride_pos_tdst)
+
+    offs_d = tl.arange(0, BLOCK_DV)
+    mask_d = offs_d < Lv
+
+    e_sum = 0.0
+    e_max = -float("inf")
+    acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
+
+    offs_v = (
+        cur_batch * stride_attn_logits_bsz
+        + cur_head * stride_attn_logits_head
+        + offs_d * stride_attn_logits_hid
+    )
+    offs_logic = (
+        cur_batch * stride_attn_logits_bsz
+        + cur_head * stride_attn_logits_head
+        + Lv * stride_attn_logits_hid
+    )
+
+    for split_kv_id in range(0, NUM_KV_SPLITS):
+        kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
+        split_kv_start = kv_len_per_split * split_kv_id
+        split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+
+        if split_kv_end > split_kv_start:
+            tv = tl.load(
+                ATTN_LOGITS + offs_v + split_kv_id * stride_attn_logits_kv_split,
+                mask=mask_d,
+                other=0.0
+            )
+            tlogic = tl.load(ATTN_LOGITS + offs_logic + split_kv_id * stride_attn_logits_kv_split)
+            n_e_max = tl.maximum(tlogic, e_max)
+
+            old_scale = tl.exp(e_max - n_e_max)
+            acc *= old_scale
+            exp_logic = tl.exp(tlogic - n_e_max)
+            acc += exp_logic * tv
+
+            e_sum = e_sum * old_scale + exp_logic
+            e_max = n_e_max
+
+    tl.store(
+        O
+        + cur_batch * stride_o_bsz
+        + 0 * stride_o_tdst
+        + cur_head * stride_o_head
+        + offs_d * stride_o_hid,
+        acc / e_sum,
+        mask=mask_d,
+    )
+
+
+def decode_block_sparse_attention_stage2(
+    logits,
+    q,
+    o,
+    v_buffer,
+    b_seq_len,
+    num_total_kv_splits,
+):
+    batch, head_num = q.shape[0], q.shape[2]
+    Lv = v_buffer.shape[-1]
+    BLOCK_DV = triton.next_power_of_2(Lv)
+
+    NUM_KV_SPLITS = num_total_kv_splits
+
+    grid = (batch, head_num)
+    _fwd_kernel_stage2[grid](
+        logits, *safe_stride(logits, 4),
+        o, *safe_stride(o, 4),
+        b_seq_len, *safe_stride(b_seq_len, 2),
+        NUM_KV_SPLITS=NUM_KV_SPLITS,
+        BLOCK_DV=BLOCK_DV,
+        Lv=Lv,
+        num_warps=4,
+        num_stages=2,
+    )
 
 
 def decode_block_sparse_attention_impl(
@@ -1021,12 +1113,11 @@ def decode_block_sparse_attention_impl(
     :param ks_start_end: (BSZ, BSRC, 2)
     :param context: (BSZ, TDST, HEAD, HID)
     """
-    decode_block_sparse_attention_stage1(
+    attn_logits, NUM_TOTAL_KV_SPLITS = decode_block_sparse_attention_stage1(
         q, k, v,
         seq_lens=seq_lens,
         indices=indices,
         ks_start_end=ks_start_end,
-        context=context,
         args=args,
         head_num=HEAD, BK=BK,
         MAX_TDST=MAX_TDST, MAX_TSRC=MAX_TSRC,
@@ -1037,7 +1128,9 @@ def decode_block_sparse_attention_impl(
         access_counter=access_counter,
         cache_miss_counter=cache_miss_counter,
     )
-    decode_block_sparse_attention_stage2()
+    decode_block_sparse_attention_stage2(
+        attn_logits, q, context, args.v_cache, seq_lens, NUM_TOTAL_KV_SPLITS
+    )
 
 
 def decode_block_sparse_attention(
