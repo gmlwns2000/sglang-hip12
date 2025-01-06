@@ -883,6 +883,8 @@ def _fwd_kernel_stage1(
                 EXTEND_BACKEND=EXTEND_BACKEND,
             )
 
+    e_sum = tl.where(e_sum == 0.0, 1e-20, e_sum)
+
     # Store results
     offs_mid_o = (
         cur_batch * stride_attn_logits_bsz
@@ -904,7 +906,7 @@ def _fwd_kernel_stage1(
     )
     tl.store(
         ATTN_LOGITS + offs_mid_o_1[:, None],
-        e_max + tl.log(e_sum),
+        e_max + tl.math.log2(e_sum),
         mask=mask_h[:, None],
     )
 
@@ -1044,9 +1046,9 @@ def _fwd_kernel_stage2(
             tlogic = tl.load(ATTN_LOGITS + offs_logic + split_kv_id * stride_attn_logits_kv_split)
             n_e_max = tl.maximum(tlogic, e_max)
 
-            old_scale = tl.exp(e_max - n_e_max)
+            old_scale = tl.math.exp2(e_max - n_e_max)
             acc *= old_scale
-            exp_logic = tl.exp(tlogic - n_e_max)
+            exp_logic = tl.math.exp2(tlogic - n_e_max)
             acc += exp_logic * tv
 
             e_sum = e_sum * old_scale + exp_logic
