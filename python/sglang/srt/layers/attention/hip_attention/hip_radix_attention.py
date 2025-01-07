@@ -18,7 +18,6 @@ import torch
 from sglang.srt.layers.attention import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.mem_cache.hip_offload_kv_pool_mha import MHATokenToHiPOffloadKVPool
-from sglang.srt.layers.attention.triton_ops.decode_sparse_attention import decode_block_sparse_attention
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -319,11 +318,6 @@ class HiPRadixAttentionBackend(AttentionBackend):
             raise Exception()
         is_gemma = hidden_size > 128
 
-        # Select sparse decoding backend
-        sparse_attn_backend = None
-        if dst_seq_len == 1 and os.environ.get('HIP_DISABLE_FLASHDECODE', '0') == '0':
-            sparse_attn_backend = decode_block_sparse_attention
-
         args = HiPAttentionArgs(
             k_cache=k_cache.view(torch.uint8) if isinstance(k_cache, torch.Tensor) and k_cache.dtype == torch.float8_e5m2 else k_cache,
             v_cache=v_cache.view(torch.uint8) if isinstance(k_cache, torch.Tensor) and v_cache.dtype == torch.float8_e5m2 else v_cache,
@@ -352,7 +346,6 @@ class HiPRadixAttentionBackend(AttentionBackend):
             scan_extend_backend=('relative' if self.hip_config.apply_v_dot
                                  else ('streaming' if is_dense else 'relative')),
             sa_extend_backend=layer_config.sa_extend_backend,
-            sparse_attn_backend=sparse_attn_backend,
         )
 
         context, metadata = dual_stage_quadratic_hip_attention(
