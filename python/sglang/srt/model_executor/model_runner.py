@@ -665,7 +665,6 @@ class ModelRunner:
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
             )
-
         logger.info(
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"

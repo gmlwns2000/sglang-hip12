@@ -44,7 +44,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import make_layers
 from sglang.utils import get_exception_traceback
@@ -314,9 +314,9 @@ class LlamaModel(nn.Module):
             )
             forward_batch.on_layer_end(i)
         forward_batch.on_model_end()
-        
+
         hidden_states, _ = self.norm(hidden_states, residual)
-        
+
         return hidden_states
 
     # If this function is called, it should always initialize KV cache scale
