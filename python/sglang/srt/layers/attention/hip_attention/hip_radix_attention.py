@@ -14,13 +14,14 @@ import logging
 import torch
 
 from sglang.srt.layers.attention import AttentionBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.mem_cache.hip_offload_kv_pool_mha import MHATokenToHiPOffloadKVPool
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.model_executor.hip_model_runner import HiPModelRunner
     from sglang.srt.layers.attention.hip_attention.hip_config import HiPAttentionConfig
+    from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.spec_info import SpecInfo
 
 from hip.models.hip_attention.gen3.attention_extend import dual_stage_quadratic_hip_attention
 from hip.models.hip_attention.gen3.attention_metadata import HiPAttentionArgs, HiPAttentionOutputMetadata
@@ -37,7 +38,7 @@ class WrapperDispatch(Enum):
 
 class HiPRadixAttentionBackend(AttentionBackend):
 
-    def __init__(self, model_runner: HiPModelRunner):
+    def __init__(self, model_runner: ModelRunner):
         super().__init__()
 
         self.hip_config: HiPAttentionConfig = model_runner.hip_attention_config
@@ -53,9 +54,12 @@ class HiPRadixAttentionBackend(AttentionBackend):
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
+        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        encoder_lens: torch.Tensor = None,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInfo],
     ):
         pass
 
@@ -65,7 +69,9 @@ class HiPRadixAttentionBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
-        encoder_lens: torch.Tensor = None,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInfo],
     ):
         pass
 
@@ -144,7 +150,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
                     offload_cache = k_cache = v_cache = None
                 else:
                     k_chunk = v_chunk = None
-                
+
                 if is_offload_cache:
                     # BUG: this padding is neccesary to match non offload scenario. why?
                     pad_size = self.max_context_len
@@ -195,10 +201,10 @@ class HiPRadixAttentionBackend(AttentionBackend):
                             layer=layer,
                             is_dense=layer.layer_id in self.hip_config.dense_layers,
                         )
-                        
+
                         o_err = ((o_req - o_req_valid) ** 2).sum()
                         assert o_err < 1e-6, o_err
-                    
+
                     o[start_len:start_len+seq_len] = o_req
                 else:
                     o_req, _ = self.forward_paged_hip(
@@ -221,7 +227,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
                         k=k_chunk,
                         v=v_chunk,
                     )
-                    
+
                     o[start_len:start_len+seq_len] = o_req
             start_len += seq_len
         assert len(decoding_reqs) == 0
@@ -250,24 +256,24 @@ class HiPRadixAttentionBackend(AttentionBackend):
         metadata = None
         if forward_batch.hip_use_cached_mask or (forward_batch.hip_metadata_cached_stage is not None):
             metadata = forward_batch.hip_metadata_cache_pool.get_hip_metadata_cache(
-                layer.layer_id, q.shape[0], 
+                layer.layer_id, q.shape[0],
                 forward_batch.batch_size,
                 forward_batch.hip_metadata_cached_stage,
             )
-        
+
         require_validation = False
         if is_offload_cache:
             assert isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool)
             require_validation = forward_batch.token_to_kv_pool.require_validation
-            
+
             if k is not None:
                 assert v is not None
                 if save_kv_cache:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, 
+                        layer, cache_loc, k, v,
                         async_copy=False, push_to_gpu_cache=True,
                     )
-            
+
             if not require_validation:
                 k_cache = v_cache = None
                 offload_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -280,7 +286,7 @@ class HiPRadixAttentionBackend(AttentionBackend):
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
             k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             offload_cache = None
-        
+
         if not require_validation:
             o, metadata = self.forward_paged_hip(
                 query=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -301,8 +307,8 @@ class HiPRadixAttentionBackend(AttentionBackend):
                 is_dense=layer.layer_id in self.hip_config.dense_layers,
 
                 online_update_cache=(
-                    forward_batch.token_to_kv_pool.online_update_cache 
-                    if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool) else 
+                    forward_batch.token_to_kv_pool.online_update_cache
+                    if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool) else
                     None
                 ),
             )
@@ -310,10 +316,10 @@ class HiPRadixAttentionBackend(AttentionBackend):
             def sse(a: torch.Tensor, b: torch.Tensor):
                 assert a.dtype == b.dtype
                 return ((a - b) ** 2).sum().item()
-            
+
             err_k = sse(offload_cache.k_uvm.bank_gpu, k_cache)
             err_v = sse(offload_cache.v_uvm.bank_gpu, v_cache)
-            
+
             o, metadata_new = self.forward_paged_hip(
                 query=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 sm_scale=layer.scaling,
@@ -322,12 +328,12 @@ class HiPRadixAttentionBackend(AttentionBackend):
                 k_cache=None,
                 v_cache=None,
                 offload_cache=offload_cache,
-                
+
                 # NOTE: to test uvm only
                 # k_cache=offload_cache.k_uvm.bank_gpu,
                 # v_cache=offload_cache.v_uvm.bank_gpu,
                 # offload_cache=None,
-                
+
                 # NOTE: to test on gpu only
                 # k_cache=k_cache,
                 # v_cache=v_cache,
@@ -343,12 +349,12 @@ class HiPRadixAttentionBackend(AttentionBackend):
                 is_dense=layer.layer_id in self.hip_config.dense_layers,
 
                 online_update_cache=(
-                    forward_batch.token_to_kv_pool.online_update_cache 
-                    if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool) else 
+                    forward_batch.token_to_kv_pool.online_update_cache
+                    if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool) else
                     None
                 ),
             )
-            
+
             o_valid, metadata_valid = self.forward_paged_hip(
                 query=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 sm_scale=layer.scaling,
@@ -368,14 +374,14 @@ class HiPRadixAttentionBackend(AttentionBackend):
                 is_dense=layer.layer_id in self.hip_config.dense_layers,
 
                 online_update_cache=(
-                    forward_batch.token_to_kv_pool.online_update_cache 
-                    if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool) else 
+                    forward_batch.token_to_kv_pool.online_update_cache
+                    if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool) else
                     None
                 ),
             )
-            
+
             err_thresh = 1e-7
-            
+
             o_sse = sse(o, o_valid)
             err_retry = -1
             err_uvm = None
@@ -394,11 +400,11 @@ class HiPRadixAttentionBackend(AttentionBackend):
                 else:
                     stage1_left_err = stage1_right_err = stage1_score_err = stage2_left_err = stage2_right_err = stage2_score_err = None
                 online_update = (
-                    forward_batch.token_to_kv_pool.online_update_cache 
-                    if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool) else 
+                    forward_batch.token_to_kv_pool.online_update_cache
+                    if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool) else
                     None
                 )
-                
+
                 o_uvm, metadata_uvm = self.forward_paged_hip(
                     query=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     sm_scale=layer.scaling,
@@ -418,15 +424,15 @@ class HiPRadixAttentionBackend(AttentionBackend):
                     is_dense=layer.layer_id in self.hip_config.dense_layers,
 
                     online_update_cache=(
-                        forward_batch.token_to_kv_pool.online_update_cache 
-                        if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool) else 
+                        forward_batch.token_to_kv_pool.online_update_cache
+                        if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool) else
                         None
                     ),
                 )
-                
+
                 offload_cache.sa_kv_cache.flush()
                 offload_cache.mask_k_cache.flush()
-                
+
                 o_retry, metadata_retry = self.forward_paged_hip(
                     query=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     sm_scale=layer.scaling,
@@ -446,19 +452,19 @@ class HiPRadixAttentionBackend(AttentionBackend):
                     is_dense=layer.layer_id in self.hip_config.dense_layers,
 
                     online_update_cache=(
-                        forward_batch.token_to_kv_pool.online_update_cache 
-                        if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool) else 
+                        forward_batch.token_to_kv_pool.online_update_cache
+                        if isinstance(forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool) else
                         None
                     ),
                 )
                 err_uvm = sse(o, o_uvm)
                 err_retry = sse(o_valid, o_retry)
-                
+
                 print(o)
                 print(o_valid)
                 print(metadata_new.indices)
                 print(metadata_valid.indices)
-            
+
                 assert o_sse < err_thresh, f"""
 sse={o_sse}
 err_k (uvm_k <=> valid_k) = {err_k}
@@ -477,13 +483,13 @@ stage2_right_err={stage2_right_err}
 stage2_score_err={stage2_score_err}
 online_update={online_update}
 """
-            
+
             metadata = metadata_new
 
         forward_batch.hip_metadata_cache_pool.set_hip_metadata_cache(
-            layer_id=layer.layer_id, 
+            layer_id=layer.layer_id,
             size=q.shape[0],
-            batch_size=forward_batch.batch_size, 
+            batch_size=forward_batch.batch_size,
             metadata=metadata,
         )
 
@@ -518,7 +524,7 @@ online_update={online_update}
         online_update_cache: bool = False,
     ) -> tuple[torch.Tensor, "HiPAttentionOutputMetadata"]:
         is_dense = layer.layer_id in self.hip_config.dense_layers
-        
+
         if len(self.hip_config.layers) == 2:
             layer_config = self.hip_config.layers[0 if is_dense else 1]
         else:
@@ -583,13 +589,13 @@ online_update={online_update}
                 (
                     'relative' if self.hip_config.apply_v_dot
                     else ('streaming' if is_dense else 'relative')
-                ) if layer_config.scan_extend_backend is None else 
+                ) if layer_config.scan_extend_backend is None else
                 layer_config.scan_extend_backend
             ),
             sa_extend_backend=layer_config.sa_extend_backend,
             online_update_cache=online_update_cache,
         )
-        
+
         context, metadata = dual_stage_quadratic_hip_attention(
             (query * sm_scale).to(query.dtype),
             k, v,

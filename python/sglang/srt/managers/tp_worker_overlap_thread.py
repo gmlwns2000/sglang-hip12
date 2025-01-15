@@ -28,6 +28,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -188,18 +189,12 @@ class TpModelWorkerClient:
 
             # Copy results to the CPU
             if model_worker_batch.return_logprob:
-                logits_output.next_token_logprobs = logits_output.next_token_logprobs[
-                    torch.arange(len(next_token_ids), device=self.device),
-                    next_token_ids,
-                ].to("cpu", non_blocking=True)
+                logits_output.next_token_logprobs = (
+                    logits_output.next_token_logprobs.to("cpu", non_blocking=True)
+                )
                 if logits_output.input_token_logprobs is not None:
                     logits_output.input_token_logprobs = (
                         logits_output.input_token_logprobs.to("cpu", non_blocking=True)
-                    )
-                    logits_output.normalized_prompt_logprobs = (
-                        logits_output.normalized_prompt_logprobs.to(
-                            "cpu", non_blocking=True
-                        )
                     )
             next_token_ids = next_token_ids.to("cpu", non_blocking=True)
             copy_done.record()
@@ -218,9 +213,6 @@ class TpModelWorkerClient:
             if logits_output.input_token_logprobs is not None:
                 logits_output.input_token_logprobs = (
                     logits_output.input_token_logprobs.tolist()
-                )
-                logits_output.normalized_prompt_logprobs = (
-                    logits_output.normalized_prompt_logprobs.tolist()
                 )
         next_token_ids = next_token_ids.tolist()
         return logits_output, next_token_ids
@@ -268,6 +260,10 @@ class TpModelWorkerClient:
         self, recv_req: UpdateWeightsFromDistributedReqInput
     ):
         success, message = self.worker.update_weights_from_distributed(recv_req)
+        return success, message
+
+    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+        success, message = self.worker.update_weights_from_tensor(recv_req)
         return success, message
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):

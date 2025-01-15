@@ -31,6 +31,7 @@ from sglang.srt.utils import (
     is_hip,
     is_ipv6,
     is_port_available,
+    nullable_str,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,11 +43,11 @@ class ServerArgs:
     model_path: str
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
-    skip_tokenizer_init: bool = False
     load_format: str = "auto"
     trust_remote_code: bool = True
     dtype: str = "auto"
     kv_cache_dtype: str = "auto"
+    quantization_param_path: nullable_str = None
     quantization: Optional[str] = None
     context_length: Optional[int] = None
     device: str = "cuda"
@@ -54,8 +55,9 @@ class ServerArgs:
     chat_template: Optional[str] = None
     is_embedding: bool = False
     revision: Optional[str] = None
+    skip_tokenizer_init: bool = False
 
-    # Port
+    # Port for the HTTP server
     host: str = "127.0.0.1"
     port: int = 30000
 
@@ -68,6 +70,7 @@ class ServerArgs:
     schedule_policy: str = "lpm"
     schedule_conservativeness: float = 1.0
     cpu_offload_gb: int = 0
+    prefill_only_one_req: bool = False
 
     # Other runtime options
     tp_size: int = 1
@@ -88,12 +91,13 @@ class ServerArgs:
 
     # API related
     api_key: Optional[str] = None
-    file_storage_pth: str = "SGLang_storage"
+    file_storage_pth: str = "sglang_storage"
     enable_cache_report: bool = False
 
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "round_robin"
+
     # Expert parallelism
     ep_size: int = 1
 
@@ -104,6 +108,22 @@ class ServerArgs:
 
     # Model override args in JSON
     json_model_override_args: str = "{}"
+
+    # LoRA
+    lora_paths: Optional[List[str]] = None
+    max_loras_per_batch: int = 8
+
+    # Kernel backend
+    attention_backend: Optional[str] = None
+    sampling_backend: Optional[str] = None
+    grammar_backend: Optional[str] = "outlines"
+
+    # Speculative decoding
+    speculative_draft_model_path: Optional[str] = None
+    speculative_algorithm: Optional[str] = None
+    speculative_num_steps: int = 5
+    speculative_num_draft_tokens: int = 64
+    speculative_eagle_topk: int = 8
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -122,15 +142,6 @@ class ServerArgs:
     hip_max_mask_cache_token_size: int = 128 * 1024
     hip_max_sa_cache_token_size: int = 16 * 1024
 
-    # LoRA
-    lora_paths: Optional[List[str]] = None
-    max_loras_per_batch: int = 8
-
-    # Kernel backend
-    attention_backend: Optional[str] = None
-    sampling_backend: Optional[str] = None
-    grammar_backend: Optional[str] = "outlines"
-
     # Optimization/debug options
     disable_radix_cache: bool = False
     disable_jump_forward: bool = False
@@ -146,6 +157,7 @@ class ServerArgs:
     enable_torch_compile: bool = False
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
+    cuda_graph_bs: Optional[List[int]] = None
     torchao_config: str = ""
     enable_nan_detection: bool = False
     enable_p2p_check: bool = False
@@ -153,6 +165,7 @@ class ServerArgs:
     triton_attention_num_kv_splits: int = 8
     num_continuous_decode_steps: int = 1
     delete_ckpt_after_loading: bool = False
+    enable_memory_saver: bool = False
 
     def __post_init__(self):
         # Set missing default values
@@ -226,6 +239,13 @@ class ServerArgs:
             )
             self.disable_cuda_graph = True
 
+        # Expert parallelism
+        if self.enable_ep_moe:
+            self.ep_size = self.tp_size
+            logger.info(
+                f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
         # Others
         if self.enable_dp_attention:
             self.dp_size = self.tp_size
@@ -238,11 +258,16 @@ class ServerArgs:
                 "Data parallel size is adjusted to be the same as tensor parallel size. "
                 "Overlap scheduler is disabled."
             )
-        # Expert parallelism
-        if self.enable_ep_moe:
-            self.ep_size = self.tp_size
+
+        # Speculative Decoding
+        if self.speculative_algorithm == "EAGLE":
+            self.prefill_only_one_req = True
+            self.disable_cuda_graph_padding = True
+            self.disable_radix_cache = True
+            self.disable_overlap_schedule = True
+            self.chunked_prefill_size = -1
             logger.info(
-                f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+                "The radix cache, chunked prefill, and overlap scheduler are disabled because of using eagle speculative decoding."
             )
 
         # GGUF
@@ -336,8 +361,17 @@ class ServerArgs:
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8_e5m2"],
-            help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" is supported for CUDA 11.8+.',
+            choices=["auto", "fp8_e5m2", "fp8_e4m3"],
+            help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" and "fp8_e4m3" is supported for CUDA 11.8+.',
+        )
+        parser.add_argument(
+            "--quantization-param-path",
+            type=nullable_str,
+            default=None,
+            help="Path to the JSON file containing the KV cache "
+            "scaling factors. This should generally be supplied, when "
+            "KV cache dtype is FP8. Otherwise, KV cache scaling factors "
+            "default to 1.0, which may cause accuracy issues. ",
         )
         parser.add_argument(
             "--quantization",
@@ -352,6 +386,8 @@ class ServerArgs:
                 "awq_marlin",
                 "bitsandbytes",
                 "gguf",
+                "modelopt",
+                "w8a8_int8",
             ],
             help="The quantization method.",
         )
@@ -393,7 +429,6 @@ class ServerArgs:
             "name, a tag name, or a commit id. If unspecified, will use "
             "the default version.",
         )
-
         # Memory and scheduling
         parser.add_argument(
             "--mem-fraction-static",
@@ -439,12 +474,17 @@ class ServerArgs:
             default=ServerArgs.schedule_conservativeness,
             help="How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
         )
-
         parser.add_argument(
             "--cpu-offload-gb",
             type=int,
             default=ServerArgs.cpu_offload_gb,
             help="How many GBs of RAM to reserve for CPU offloading",
+        )
+        parser.add_argument(
+            "--prefill-only-one-req",
+            type=bool,
+            help="If true, we only prefill one request at one prefill batch",
+            default=ServerArgs.prefill_only_one_req,
         )
 
         # Other runtime options
@@ -524,7 +564,7 @@ class ServerArgs:
             "--decode-log-interval",
             type=int,
             default=ServerArgs.decode_log_interval,
-            help="The log interval of decode batch",
+            help="The log interval of decode batch.",
         )
 
         # API related
@@ -564,6 +604,7 @@ class ServerArgs:
                 "shortest_queue",
             ],
         )
+
         # Expert parallelism
         parser.add_argument(
             "--expert-parallel-size",
@@ -593,6 +634,77 @@ class ServerArgs:
             type=str,
             help="A dictionary in JSON string format used to override default model configurations.",
             default=ServerArgs.json_model_override_args,
+        )
+
+        # LoRA
+        parser.add_argument(
+            "--lora-paths",
+            type=str,
+            nargs="*",
+            default=None,
+            action=LoRAPathAction,
+            help="The list of LoRA adapters. You can provide a list of either path in str or renamed path in the format {name}={path}",
+        )
+        parser.add_argument(
+            "--max-loras-per-batch",
+            type=int,
+            default=8,
+            help="Maximum number of adapters for a running batch, include base-only request",
+        )
+
+        # Kernel backend
+        parser.add_argument(
+            "--attention-backend",
+            type=str,
+            choices=["flashinfer", "triton", "torch_native"],
+            default=ServerArgs.attention_backend,
+            help="Choose the kernels for attention layers.",
+        )
+        parser.add_argument(
+            "--sampling-backend",
+            type=str,
+            choices=["flashinfer", "pytorch"],
+            default=ServerArgs.sampling_backend,
+            help="Choose the kernels for sampling layers.",
+        )
+        parser.add_argument(
+            "--grammar-backend",
+            type=str,
+            choices=["xgrammar", "outlines"],
+            default=ServerArgs.grammar_backend,
+            help="Choose the backend for grammar-guided decoding.",
+        )
+
+        # Speculative decoding
+        parser.add_argument(
+            "--speculative-algorithm",
+            type=str,
+            choices=["EAGLE"],
+            help="Speculative algorithm.",
+        )
+        parser.add_argument(
+            "--speculative-draft-model-path",
+            type=str,
+            help="The path of the draft model weights. This can be a local folder or a Hugging Face repo ID.",
+        )
+        parser.add_argument(
+            "--speculative-num-steps",
+            type=int,
+            help="The number of steps sampled from draft model in Speculative Decoding.",
+            default=ServerArgs.speculative_num_steps,
+        )
+        parser.add_argument(
+            "--speculative-num-draft-tokens",
+            type=int,
+            help="The number of token sampled from draft model in Speculative Decoding.",
+            default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--speculative-eagle-topk",
+            type=int,
+            help="The number of token sampled from draft model in eagle2 each step.",
+            choices=[1, 2, 4, 8],
+            default=ServerArgs.speculative_eagle_topk,
         )
 
         # Double Sparsity
@@ -644,7 +756,7 @@ class ServerArgs:
             default=ServerArgs.hip_attention_config,
             help="Path to the HiP attention config file, or the json in string format.",
         )
-        
+
         # HiP Attention Offload
         parser.add_argument(
             "--enable-hip-offload",
@@ -668,45 +780,6 @@ class ServerArgs:
                 "On-gpu cache size of sparse attention kernels. "
                 "This will be major factor to determine mask cached decoding step."
             )
-        )
-
-        # LoRA
-        parser.add_argument(
-            "--lora-paths",
-            type=str,
-            nargs="*",
-            default=None,
-            action=LoRAPathAction,
-            help="The list of LoRA adapters. You can provide a list of either path in str or renamed path in the format {name}={path}",
-        )
-        parser.add_argument(
-            "--max-loras-per-batch",
-            type=int,
-            default=8,
-            help="Maximum number of adapters for a running batch, include base-only request",
-        )
-
-        # Kernel backend
-        parser.add_argument(
-            "--attention-backend",
-            type=str,
-            choices=["flashinfer", "triton", "torch_native"],
-            default=ServerArgs.attention_backend,
-            help="Choose the kernels for attention layers.",
-        )
-        parser.add_argument(
-            "--sampling-backend",
-            type=str,
-            choices=["flashinfer", "pytorch"],
-            default=ServerArgs.sampling_backend,
-            help="Choose the kernels for sampling layers.",
-        )
-        parser.add_argument(
-            "--grammar-backend",
-            type=str,
-            choices=["xgrammar", "outlines"],
-            default=ServerArgs.grammar_backend,
-            help="Choose the backend for grammar-guided decoding.",
         )
 
         # Optimization/debug options
@@ -783,6 +856,12 @@ class ServerArgs:
             help="Set the maximum batch size for cuda graph.",
         )
         parser.add_argument(
+            "--cuda-graph-bs",
+            type=int,
+            nargs="+",
+            help="Set the list of batch sizes for cuda graph.",
+        )
+        parser.add_argument(
             "--torchao-config",
             type=str,
             default=ServerArgs.torchao_config,
@@ -823,27 +902,10 @@ class ServerArgs:
             action="store_true",
             help="Delete the model checkpoint after loading the model.",
         )
-
-        # Deprecated arguments
         parser.add_argument(
-            "--enable-overlap-schedule",
-            action=DeprecatedAction,
-            help="'--enable-overlap-schedule' is deprecated. It is enabled by default now. Please drop this argument.",
-        )
-        parser.add_argument(
-            "--disable-flashinfer",
-            action=DeprecatedAction,
-            help="'--disable-flashinfer' is deprecated. Please use '--attention-backend triton' instead.",
-        )
-        parser.add_argument(
-            "--disable-flashinfer-sampling",
-            action=DeprecatedAction,
-            help="'--disable-flashinfer-sampling' is deprecated. Please use '--sampling-backend pytroch' instead.",
-        )
-        parser.add_argument(
-            "--disable-disk-cache",
-            action=DeprecatedAction,
-            help="'--disable-disk-cache' is deprecated. Please use '--disable-outlines-disk-cache' instead.",
+            "--enable-memory-saver",
+            action="store_true",
+            help="Allow saving memory using release_memory_occupation and resume_memory_occupation",
         )
 
     @classmethod
@@ -922,7 +984,10 @@ class PortArgs:
         while True:
             if is_port_available(port):
                 break
-            port += 42
+            if port < 60000:
+                port += 42
+            else:
+                port -= 43
 
         return PortArgs(
             tokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
