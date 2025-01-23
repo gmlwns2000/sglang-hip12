@@ -1,4 +1,4 @@
-# **MOVED TO [DeepAuto.ai](https://github.com/DeepAuto-AI/sglang)**
+# **MOVED TO [DeepAuto-ai/sglang](https://github.com/DeepAuto-AI/sglang)**
 
 
 <div align="center"  id="sglangtop">
